@@ -7,7 +7,14 @@ import seaborn as sns
 
 import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
+from scipy.stats import norm
 
+from pykrx import stock
+from pykrx import bond
+from tqdm import tqdm
+
+
+### US Equity indices
 index_component = {
         'sp500': ('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', 0),
         'nasdaq100': ('https://en.wikipedia.org/wiki/Nasdaq-100#Components', 4),
@@ -46,6 +53,123 @@ def get_price_returns(index='sp500', interval='1d'):
     
     return output_dict
 
+### KR Equity indices
+def get_kr_market_indices(market):
+    '''markets_list = ['KOSPI','KOSDAQ','KRX','테마']'''
+    tickers = stock.get_index_ticker_list(market=market)
+    
+    sub_cat = {}
+    for ticker in tickers:
+        index_name = stock.get_index_ticker_name(ticker)
+        sub_cat[ticker] = f'{market}:{index_name}'
+    sub_cat = dict((v, k) for k, v in sub_cat.items())
+    
+    indices_df = pd.DataFrame(sub_cat.items(), columns=['market_index_name','code'])
+    indices_df[['market','index_name']] = indices_df['market_index_name'].str.split(':', expand=True)
+    indices_df = indices_df.drop(columns=['market_index_name'])
+
+    return indices_df
+
+def get_kr_market_indices_summary():
+    markets_list = ['KOSPI','KOSDAQ','KRX','테마']
+    # get market indices names and codes
+    market_indices_all = pd.concat([get_kr_market_indices(market) for market in markets_list], axis=0)
+    # get market indices listing info
+    market_listing_info_all = pd.concat([stock.get_index_listing_date(market) for market in markets_list], axis=0)
+    market_listing_info_all['기준시점'] = market_listing_info_all['기준시점'].str.replace('.', '')
+    market_listing_info_all['발표시점'] = market_listing_info_all['발표시점'].str.replace('.', '')
+    
+    # merge all market index summary
+    market_indices_summary = market_indices_all.merge(
+        market_listing_info_all.reset_index().rename(columns={'지수명':'index_name','기준시점':'from_date'}),
+        how='left',
+        on='index_name'
+    )
+    return market_indices_summary
+
+def clean_kr_index_data(chosen_index):
+    # clean outlier data
+    chosen_index[['PER','PBR','DY']] = chosen_index[['PER','PBR','DY']].replace({0:np.nan, np.inf:np.nan, -np.inf:np.nan}).ffill()
+    # define starting point as nonzero fundamentals
+    nonzero_start = chosen_index[(~chosen_index[['PER','PBR','DY']].isnull()).sum(axis=1) == 3].index.min()
+    # filter index from nonzero fundamentals
+    cleaned_index = chosen_index.loc[nonzero_start:]
+
+    return cleaned_index
+
+def extract_kr_fundamental_values(cleaned_index):
+    # extract index fundamentals
+    index_EPS = (cleaned_index['close'] / cleaned_index['PER'])
+    index_BPS = (cleaned_index['close'] / cleaned_index['PBR'])
+    index_DPS = (cleaned_index['close'] * cleaned_index['DY'])
+    extracted_index_fundamentals = {
+        'EPS': index_EPS,
+        'BPS': index_BPS,
+        'DPS': index_DPS 
+    }
+    return extracted_index_fundamentals
+
+def generate_kr_multiple_resistance_support(index_valuation_df, fundamental, view_min, view_max, window=252, confidence_level=0.99):
+    multiple_fundamentals_mapping = {
+        'PER':'EPS',
+        'PBR':'BPS',
+        'DY':'DPS'
+    }
+    index_fundamental_ratio = index_valuation_df[fundamental]
+    fundamental_value = multiple_fundamentals_mapping[fundamental]
+
+    # based on view
+    index_valuation_df['multiple_view_min'] = view_min
+    index_valuation_df['multiple_view_max'] = view_max
+    # based on global minmax
+    index_valuation_df['multiple_global_min'] = index_fundamental_ratio.min()
+    index_valuation_df['multiple_global_max'] = index_fundamental_ratio.max()
+    # based on cumulative minmax
+    index_valuation_df['multiple_cum_min'] = index_fundamental_ratio.cummin()
+    index_valuation_df['multiple_cum_max'] = index_fundamental_ratio.cummax()
+    # based on rolling minmax
+    index_valuation_df['multiple_rolling_min'] = index_fundamental_ratio.rolling(window=window).min()
+    index_valuation_df['multiple_rolling_max'] = index_fundamental_ratio.rolling(window=window).max()
+    # based on confidence interval z-score
+    z_score = get_two_tailed_z_score(confidence_level=confidence_level)
+    prob = get_two_tailed_prob(z_score_input=z_score)
+    index_valuation_df['multiple_norm_min'] = index_fundamental_ratio - index_fundamental_ratio.rolling(window=window).std() * z_score
+    index_valuation_df['multiple_norm_max'] = index_fundamental_ratio + index_fundamental_ratio.rolling(window=window).std() * z_score
+
+    # index valuation
+    for col in index_valuation_df.filter(regex='multiple_.*').columns.tolist():
+        method = col.split('_')[1]
+        bound = col.split('_')[2]
+        if fundamental_value == 'DPS':
+            index_valuation_df[f'valuation_{method}_{bound}'] = 1 / index_valuation_df[col] * index_valuation_df[fundamental_value]
+        else:
+            index_valuation_df[f'valuation_{method}_{bound}'] = index_valuation_df[col] * index_valuation_df[fundamental_value]
+
+    return index_valuation_df
+
+### Z-score and standardization for analysis
+def get_two_tailed_prob(z_score_input):
+    # 1. Calculate Probability from Z-Score
+    # Cumulative distribution function
+    probability_from_z = norm.cdf(z_score_input) - norm.cdf(-z_score_input)
+    print(f"Probability for Z-score ({z_score_input}): {probability_from_z}")
+    
+    return probability_from_z
+
+def get_two_tailed_z_score(confidence_level):
+    # 2. Calculate Z-Score from Probability for Two-Tailed Test
+    # The remaining probability
+    alpha = 1 - confidence_level
+    # For two-tailed test, divide alpha by 2
+    z_score = norm.ppf(1 - alpha / 2) 
+    print(f"Z-score for a ({confidence_level*100}%) two-tailed probability: {z_score}")
+    
+    return z_score
+
+def standardize(ser):
+    return (ser[-1] - ser.mean()) / ser.std()
+
+### Beta and Correlation computation
 def plot_corr_mat(returns, ax=None):
     corr_mat = returns.dropna().corr()
     
@@ -95,9 +219,6 @@ def filter_outliers(ser, lower_percentile=0.01, upper_percentile=0.99):
     lower_threshold,upper_threshold = ser.quantile([lower_percentile, upper_percentile])
     filtered_ser = ser[ser.between(lower_threshold, upper_threshold)]
     return filtered_ser
-
-def standardize(ser):
-    return (ser - ser.mean()) / ser.std()
     
 def vectorized_rolling_calc(returns, market_definition='^GSPC', window_size=30, beta=True):
     rolling_list = []
